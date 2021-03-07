@@ -3,6 +3,8 @@ import json
 import os
 import ssl
 from io import StringIO
+import psycopg2
+from psycopg2.extras import execute_values
 
 from aiohttp.client import ClientSession
 from aiohttp.client_exceptions import ClientError
@@ -56,36 +58,45 @@ async def show_create_table(table_name: str):
     return resp
 
 
-async def send_csv(table_name, rows):
-    data = StringIO()
-    cwr = csv.writer(data, quoting=csv.QUOTE_ALL)
-    cwr.writerows(rows)
-    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT CSV', data)
-
-
-async def send_json_each_row(table_name, rows):
-    data = StringIO()
-    for row in rows:
-        assert isinstance(row, dict)
-        data.write(json.dumps(row))
-        data.write('\n')
-    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT JSONEachRow', data)
-
-
 @app.post('/write_log')
 async def write_log(request: Request):
     body = await request.json()
-    res = []
+    rows_to_inesrt = []
     for log_entry in body:
-        table_name = log_entry['table_name']
-        rows = log_entry['rows']
-        if log_entry.get('format') == 'list':
-            res.append(await send_csv(table_name, rows))
-        elif log_entry.get('format') == 'json':
-            res.append(await send_json_each_row(table_name, rows))
-        else:
-            res.append({'error': f'unknown format {log_entry.get("format")}, you must use list or json'})
-    return res
+        rows_to_inesrt.append(
+            dict (
+                ch_table=log_entry['table_name'],
+                rows=json.dumps(log_entry['rows']),
+                format=log_entry.get('format')
+            )
+        )
+        
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        database="logs",
+        user="postgres",
+        password="password1"
+    )
+    salesorder_write = """
+        INSERT INTO logs (
+            ch_table, rows, format
+        ) values %s
+    """
+    execute_values(
+        conn.cursor(),
+        salesorder_write,
+        rows_to_inesrt,
+        template = """(
+            %(ch_table)s,
+            %(rows)s,
+            %(format)s
+        )""",
+        page_size = 1000
+    )
+    conn.commit()
+
+
+    return 'OK'
 
 
 @app.get('/healthcheck')
