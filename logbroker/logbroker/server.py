@@ -81,9 +81,11 @@ async def write_log(request: Request):
         INSERT INTO logs (
             ch_table, rows, format
         ) values %s
+        RETURNING id
     """
+    cursor = conn.cursor()
     execute_values(
-        conn.cursor(),
+        cursor,
         salesorder_write,
         rows_to_inesrt,
         template = """(
@@ -93,10 +95,40 @@ async def write_log(request: Request):
         )""",
         page_size = 1000
     )
+    ids = cursor.fetchall()
     conn.commit()
 
+    response = []
+    for _id in ids:
+        response.append(_id[0])
 
-    return 'OK'
+    return response
+
+
+@app.post('/write_log/status')
+async def write_log_status(request: Request):
+    body = await request.json()
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        database="logs",
+        user="postgres",
+        password="password1"
+    )
+    cur = conn.cursor()
+    cur.execute(
+            f"""
+        SELECT count(*), '' FROM logs WHERE id = {body['op_id']}
+        UNION ALL
+        SELECT count(*), error FROM errors WHERE id = {body['op_id']} GROUP BY error;
+        """
+    )
+    rows = cur.fetchall()
+    if rows[0][0] == 1:
+        return {'status': 'processing'}
+    elif len(rows) == 2:
+        return {'status': 'error', 'error': rows[1][1]}
+    else:
+        return {'status': 'ok'}
 
 
 @app.get('/healthcheck')

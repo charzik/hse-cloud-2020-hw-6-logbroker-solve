@@ -7,6 +7,7 @@ import ssl
 import time
 import psycopg2
 from io import StringIO
+from psycopg2.extras import execute_values
 
 from aiohttp.client import ClientSession
 from aiohttp.client_exceptions import ClientError
@@ -20,55 +21,62 @@ CH_PORT = int(os.getenv('LOGBROKER_CH_PORT', 8123))
 CH_CERT_PATH = os.getenv('LOGBROKER_CH_CERT_PATH', None)
 
 
-async def send_csv(table_name, rows):
+async def execute_query(query, data=None, json=None):
     url = f'http://{CH_HOST}:{CH_PORT}/'
     params = {
-        'query': f'INSERT INTO \"{table_name}\" FORMAT CSV'.strip()
+        'query': query.strip()
     }
+    headers = {}
+    if CH_USER is not None:
+        headers['X-ClickHouse-User'] = CH_USER
+        if CH_PASSWORD is not None:
+            headers['X-ClickHouse-Key'] = CH_PASSWORD
+    ssl_context = ssl.create_default_context(cafile=CH_CERT_PATH) if CH_CERT_PATH is not None else None
 
+    async with ClientSession() as session:
+        async with session.post(url, params=params, data=data, json=json, headers=headers, ssl=ssl_context) as resp:
+            await resp.read()
+            try:
+                resp.raise_for_status()
+                return resp, None
+            except ClientError as e:
+                return resp, str(e)
+
+
+async def query_wrapper(query, data=None, json=None):
+    res, err = await execute_query(query, data, json)
+    return err
+
+
+async def send_csv(table_name, rows):
     csv_rows = []
     for row in rows:
         csv_rows.append(','.join(map(str, row)))
     data = '\n'.join(csv_rows)
 
-    async with ClientSession() as session:
-        async with session.post(url, params=params, data=data) as resp:
-            await resp.read()
-            try:
-                resp.raise_for_status()
-                return resp, None
-            except ClientError as e:
-                return resp, {'error': str(e)}
+    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT CSV', data=data)
 
 
 async def send_json_each_row(table_name, rows):
-    url = f'http://{CH_HOST}:{CH_PORT}/'
-    params = {
-        'query': f'INSERT INTO \"{table_name}\" FORMAT JSONEachRow'.strip()
-    }
-
-    async with ClientSession() as session:
-        async with session.post(url, params=params, json=rows) as resp:
-            await resp.read()
-            try:
-                resp.raise_for_status()
-                return resp, None
-            except ClientError as e:
-                return resp, {'error': str(e)}
+    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT JSONEachRow', json=rows)
 
 
 async def process(rows):
-    res = []
+    errors = []
     for row in rows:
+        error = None
         table_name = row[1]
         ch_rows = row[2]
         if row[3] == 'list':
-            res.append(await send_csv(table_name, ch_rows))
+            error = await send_csv(table_name, ch_rows)
         elif row[3] == 'json':
-            res.append(await send_json_each_row(table_name, ch_rows))
+            error = await send_json_each_row(table_name, ch_rows)
         else:
-            res.append({'error': f'unknown format {row[3]}, you must use list or json'})
-    return res
+            error = f'unknown format {row[3]}, you must use list or json'
+
+        if error:
+            errors.append(dict(id=row[0], error=error))
+    return errors
 
 
 async def main():
@@ -94,8 +102,26 @@ async def main():
         )
         rows = cur.fetchall()
 
-        res = await process(rows)
-        print(res)
+        errors = await process(rows)
+
+        if errors:
+            salesorder_write = """
+                INSERT INTO errors (
+                    id, error
+                ) values %s
+            """
+            cursor = conn.cursor()
+            execute_values(
+                cursor,
+                salesorder_write,
+                errors,
+                template = """(
+                    %(id)s,
+                    %(error)s
+                )""",
+                page_size=1000
+            )
+            conn.commit()
 
         ids = []
         for row in rows:
