@@ -14,25 +14,25 @@ from fastapi import FastAPI, Request, Response
 
 CH_HOST = os.getenv('LOGBROKER_CH_HOST', 'localhost')
 PG_HOST = os.getenv('LOGBROKER_PG_HOST', 'localhost')
-CH_USER = os.getenv('LOGBROKER_CH_USER')
-CH_PASSWORD = os.getenv('LOGBROKER_CH_PASSWORD')
+CH_USER = os.getenv('LOGBROKER_CH_USER', None)
+CH_PASSWORD = os.getenv('LOGBROKER_CH_PASSWORD', None)
 CH_PORT = int(os.getenv('LOGBROKER_CH_PORT', 8123))
-CH_CERT_PATH = os.getenv('LOGBROKER_CH_CERT_PATH')
+CH_CERT_PATH = os.getenv('LOGBROKER_CH_CERT_PATH', None)
 
-async def execute_query(query, data=None):
+
+async def send_csv(table_name, rows):
     url = f'http://{CH_HOST}:{CH_PORT}/'
     params = {
-        'query': query.strip()
+        'query': f'INSERT INTO \"{table_name}\" FORMAT CSV'.strip()
     }
-    headers = {}
-    if CH_USER is not None:
-        headers['X-ClickHouse-User'] = CH_USER
-        if CH_PASSWORD is not None:
-            headers['X-ClickHouse-Key'] = CH_PASSWORD
-    ssl_context = ssl.create_default_context(cafile=CH_CERT_PATH) if CH_CERT_PATH is not None else None
+
+    csv_rows = []
+    for row in rows:
+        csv_rows.append(','.join(map(str, row)))
+    data = '\n'.join(csv_rows)
 
     async with ClientSession() as session:
-        async with session.post(url, params=params, data=data, headers=headers, ssl=ssl_context) as resp:
+        async with session.post(url, params=params, data=data) as resp:
             await resp.read()
             try:
                 resp.raise_for_status()
@@ -40,27 +40,21 @@ async def execute_query(query, data=None):
             except ClientError as e:
                 return resp, {'error': str(e)}
 
-async def query_wrapper(query, data=None):
-    res, err = await execute_query(query, data)
-    if err is not None:
-        return err
-    return await res.text()
-
-
-async def send_csv(table_name, rows):
-    data = StringIO()
-    cwr = csv.writer(data, quoting=csv.QUOTE_ALL)
-    cwr.writerows(rows)
-    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT CSV', data)
-
 
 async def send_json_each_row(table_name, rows):
-    data = StringIO()
-    for row in rows:
-        assert isinstance(row, dict)
-        data.write(json.dumps(row))
-        data.write('\n')
-    return await query_wrapper(f'INSERT INTO \"{table_name}\" FORMAT JSONEachRow', data)
+    url = f'http://{CH_HOST}:{CH_PORT}/'
+    params = {
+        'query': f'INSERT INTO \"{table_name}\" FORMAT JSONEachRow'.strip()
+    }
+
+    async with ClientSession() as session:
+        async with session.post(url, params=params, json=rows) as resp:
+            await resp.read()
+            try:
+                resp.raise_for_status()
+                return resp, None
+            except ClientError as e:
+                return resp, {'error': str(e)}
 
 
 async def process(rows):
